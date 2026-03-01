@@ -1,0 +1,22 @@
+[project]
+name = "cl"
+version = "0.1.0"
+description = "Interactive Claude CLI with session history and resume"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+cl = "cl_tool:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools]
+py-modules = ["cl_tool"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths  = ["tests"]
