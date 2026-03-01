@@ -346,6 +346,7 @@ def run_pipeline(
                 for line in claude_proc.stdout:
                     jf.write(line)
                     pmr_proc.stdin.write(line)  # type: ignore[union-attr]
+                    pmr_proc.stdin.flush()  # type: ignore[union-attr]
             pmr_proc.stdin.close()  # type: ignore[union-attr]
 
         tee_thread = threading.Thread(target=_tee, daemon=True)
