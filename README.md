@@ -4,6 +4,10 @@ Interactive CLI wrapper for [Claude](https://claude.ai) with session history,
 prompt editing, and rich output via
 [print-my-ride](https://github.com/bpayne/print-my-ride).
 
+<p align="center">
+  <img src="demo/demo.svg" alt="cl demo" />
+</p>
+
 ## What it does
 
 1. Opens `$EDITOR` (default: `vim`) so you can compose a prompt.
