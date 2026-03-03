@@ -17,6 +17,7 @@ import argparse
 import configparser
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -102,11 +103,53 @@ def find_sessions(sessions_base: Path) -> list[Path]:
     )
 
 
+def _parse_front_matter(path: Path) -> dict[str, str]:
+    """Parse YAML front matter from a session file.
+
+    Returns a dict of key-value pairs from the ``---`` delimited block at the
+    top of the file.  Returns an empty dict if the file has no front matter.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    matter = {}
+    for line in text[4:end].splitlines():
+        key, _, value = line.partition(": ")
+        if value:
+            matter[key.strip()] = value.strip()
+    return matter
+
+
 def find_session_file(sessions_base: Path, session_id: str) -> Path | None:
-    """Find an existing session file by ID across all date subdirs, or None."""
-    for p in sessions_base.glob(f"*/{session_id}.md"):
-        return p
+    """Find an existing session file by session ID in front matter, or None."""
+    for p in sessions_base.glob("*/*.md"):
+        matter = _parse_front_matter(p)
+        if matter.get("session") == session_id:
+            return p
     return None
+
+
+def find_project_sessions(sessions_base: Path, project_dir: Path) -> list[Path]:
+    """Return session files whose ``project`` front matter matches *project_dir*.
+
+    Results are sorted newest-first by file modification time.
+    """
+    results: list[Path] = []
+    for p in sorted(
+        sessions_base.glob("*/*.md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        matter = _parse_front_matter(p)
+        if matter.get("project") == str(project_dir):
+            results.append(p)
+    return results
 
 
 def select_session_fzf(sessions: list[Path]) -> Path | None:
@@ -179,6 +222,75 @@ def select_session(sessions: list[Path]) -> Path | None:
     return result
 
 
+# ── Tmux helpers ─────────────────────────────────────────────────────────────
+
+
+def _in_tmux() -> bool:
+    """Return True if running inside a tmux session."""
+    return bool(os.environ.get("TMUX"))
+
+
+# ── Session summary ──────────────────────────────────────────────────────────
+
+
+def _session_summary_comment(session_file: Path) -> str:
+    """Build a comment block summarizing the session being resumed.
+
+    Lines start with ``#`` and are stripped from the prompt before sending
+    to Claude.
+    """
+    matter = _parse_front_matter(session_file)
+    slug = session_file.stem
+    date_str = matter.get("date", "")
+
+    # Extract prompts from the session file.
+    prompts: list[str] = []
+    try:
+        for line in session_file.read_text().splitlines():
+            if line.startswith("> "):
+                prompts.append(line[2:].strip())
+    except OSError:
+        pass
+
+    header = f"# Resuming: {slug}"
+    if date_str:
+        header += f" ({date_str})"
+
+    lines = [header]
+    for p in prompts[-5:]:
+        display = p[:80] + ("..." if len(p) > 80 else "")
+        lines.append(f"#   > {display}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _strip_leading_comments(text: str) -> str:
+    """Remove leading ``#`` comment lines and subsequent blank lines."""
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and lines[i].lstrip().startswith("#"):
+        i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return "".join(lines[i:])
+
+
+def _comment_end_line(text: str) -> int:
+    """Return the 1-based line number of the first non-comment, non-blank line.
+
+    Returns 0 if the text does not start with ``#`` comment lines.
+    """
+    if not text or not text.lstrip().startswith("#"):
+        return 0
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and lines[i].lstrip().startswith("#"):
+        i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return i + 1 if i < len(lines) else i + 1
+
+
 # ── Prompt handling ───────────────────────────────────────────────────────────
 
 
@@ -198,6 +310,61 @@ def build_stdin_block(content: str) -> str:
     return f"\n\n```\n{content}\n```\n"
 
 
+def _edit_prompt_tmux(
+    ed: str,
+    tmpfile: Path,
+    hist_file: Path | None = None,
+) -> str:
+    """Open editor in a tmux split pane, optionally showing history in another pane.
+
+    Uses ``tmux split-window`` to launch the editor and ``tmux wait-for`` to
+    block until the editor exits.  When *hist_file* is supplied, a separate
+    tmux pane displays the history (read-only via ``less +G``) and is killed
+    automatically when the editor closes.
+
+    Returns the full text of the edited file (may be empty / whitespace-only).
+    """
+    channel = f"cl-edit-done-{os.getpid()}"
+    hist_pane: str | None = None
+
+    try:
+        if hist_file and hist_file.exists():
+            # Open history in a tmux split (top half, read-only).
+            result = subprocess.run(
+                [
+                    "tmux", "split-window", "-v", "-b", "-l", "50%",
+                    "-P", "-F", "#{pane_id}",
+                    f"less +G '{hist_file}'",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            hist_pane = result.stdout.strip() or None
+
+        # Open editor in a tmux split pane; signal channel on exit.
+        start = _comment_end_line(tmpfile.read_text())
+        start_flag = f" +{start}" if start and ed in ("vim", "nvim") else ""
+        subprocess.run(
+            [
+                "tmux", "split-window", "-v",
+                f"{ed}{start_flag} '{tmpfile}'; tmux wait-for -S {channel}",
+            ],
+            check=False,
+        )
+
+        # Block until the editor exits.
+        subprocess.run(["tmux", "wait-for", channel], check=False)
+
+        return tmpfile.read_text()
+    finally:
+        if hist_pane:
+            subprocess.run(
+                ["tmux", "kill-pane", "-t", hist_pane],
+                capture_output=True,
+                check=False,
+            )
+
+
 def edit_prompt(
     initial_content: str = "",
     hist_file: Path | None = None,
@@ -207,8 +374,17 @@ def edit_prompt(
 ) -> str:
     """Open $EDITOR so the user can compose a prompt.
 
-    When *hist_file* is supplied and the editor is vim/nvim, opens a split
-    window (history read-only on top, prompt editable on bottom).
+    When running inside tmux, delegates to :func:`_edit_prompt_tmux` which uses
+    ``tmux split-window`` to open the editor in a separate pane.  For
+    continue/resume sessions the history is shown in a companion tmux pane
+    instead of a vim internal split.
+
+    When *not* in tmux, falls back to the original behaviour: vim/nvim opens a
+    split window (history read-only on top, prompt editable on bottom) when
+    *hist_file* is supplied; other editors get a plain single-file view.
+
+    If *initial_content* starts with ``#`` comment lines, vim/nvim will place
+    the cursor on the first non-comment line.
 
     Returns the full text of the edited file (may be empty / whitespace-only).
     """
@@ -219,6 +395,10 @@ def edit_prompt(
             f.write(initial_content)
         tmpfile = Path(tmp)
 
+        if _in_tmux():
+            return _edit_prompt_tmux(ed, tmpfile, hist_file)
+
+        # ── Non-tmux fallback ─────────────────────────────────────────────
         # Open /dev/tty so the editor gets keyboard input even when our stdin
         # is a pipe.
         tty_stdin = None
@@ -244,7 +424,12 @@ def edit_prompt(
                     stdin=tty_stdin,
                 )
             else:
-                subprocess.run([ed, str(tmpfile)], stdin=tty_stdin)
+                start = _comment_end_line(initial_content)
+                cmd = [ed]
+                if start and ed in ("vim", "nvim"):
+                    cmd.append(f"+{start}")
+                cmd.append(str(tmpfile))
+                subprocess.run(cmd, stdin=tty_stdin)
         finally:
             if tty_stdin:
                 tty_stdin.close()
@@ -278,6 +463,60 @@ def extract_session_id(json_path: Path) -> str | None:
         if sid:
             return sid
     return None
+
+
+# ── Slug generation ───────────────────────────────────────────────────────────
+
+
+def _sanitize_slug(raw: str) -> str:
+    """Convert a raw string to a kebab-case filename slug (max 60 chars)."""
+    slug = raw.strip().lower()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug)
+    slug = slug.strip("-")
+    # Keep at most 5 words, 60 chars.
+    parts = slug.split("-")
+    if len(parts) > 5:
+        slug = "-".join(parts[:5])
+    return slug[:60]
+
+
+def generate_slug(
+    prompt: str,
+    project_dir: Path,
+    *,
+    claude_bin: str = "claude",
+) -> str:
+    """Generate a semantic kebab-case slug for a new session file.
+
+    Calls the Claude CLI to produce a 2-4 word summary of the session.
+    Falls back to a timestamp-based name on any failure.
+    """
+    slug_prompt = (
+        "Generate a 2-4 word kebab-case slug summarizing this coding session.\n"
+        f"Project: {project_dir.name}\n"
+        f"User prompt: {prompt[:300]}\n\n"
+        "Reply with ONLY the slug (e.g. fix-auth-bug). No quotes, no explanation."
+    )
+    try:
+        result = subprocess.run(
+            [claude_bin, "--print"],
+            input=slug_prompt,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            slug = _sanitize_slug(result.stdout)
+            if slug:
+                return slug
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    # Fallback: timestamp-based name.
+    from datetime import datetime
+
+    return datetime.now().strftime("session-%H%M%S")
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -365,6 +604,7 @@ def append_to_history(
     md_file: Path,
     *,
     project_dir: Path | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Append "> {prompt}\\n\\n{md_content}" to *hist_file*.
 
@@ -378,7 +618,7 @@ def append_to_history(
     with open(hist_file, "a") as f:
         if is_new and project_dir is not None:
             f.write("---\n")
-            f.write(f"session: {hist_file.stem}\n")
+            f.write(f"session: {session_id or hist_file.stem}\n")
             f.write(f"project: {project_dir}\n")
             f.write(f"date: {date.today().isoformat()}\n")
             f.write("---\n\n")
@@ -392,8 +632,9 @@ def append_to_history(
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     """Parse cl-specific flags; return (namespace, args_to_forward_to_claude).
 
-    - ``-c`` / ``--continue`` → stored in namespace AND appended to the
-      claude passthrough list as ``--continue``.
+    - ``-c`` / ``--continue`` → stored in namespace only; ``main()`` decides
+      whether to add ``--continue`` or ``--resume <id>`` based on project
+      session history.
     - ``-r`` / ``--resume``   → stored in namespace only; NOT forwarded
       (replaced later by ``--resume <session_id>``).
     - Everything else         → forwarded as-is via parse_known_args.
@@ -419,10 +660,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     )
     ns, extra = parser.parse_known_args(argv)
 
-    # --continue is also forwarded to claude so it continues server-side.
+    # Neither --continue nor --resume is forwarded here; main() decides
+    # whether to add --continue or --resume <id> based on project history.
     claude_passthrough: list[str] = list(extra)
-    if ns.continue_session:
-        claude_passthrough.append("--continue")
 
     return ns, claude_passthrough
 
@@ -458,16 +698,28 @@ def main(argv: list[str] | None = None) -> int:
         session_file = select_session(sessions)
         if session_file is None:
             return 0
-        resume_id = session_file.stem  # filename sans .md = session ID
+        resume_id = (
+            _parse_front_matter(session_file).get("session") or session_file.stem
+        )
         ns.continue_session = True  # open split-view just like -c
 
-    # ── Find history file for split-view ──────────────────────────────────────
-    hist_file: Path | None = None
-    if ns.continue_session:
-        hist_file = session_file or next(iter(find_sessions(sessions_base)), None)
+    # ── Project-specific continue ─────────────────────────────────────────────
+    if ns.continue_session and session_file is None:
+        project_sessions = find_project_sessions(sessions_base, Path.cwd())
+        if project_sessions:
+            session_file = project_sessions[0]
+            resume_id = _parse_front_matter(session_file).get("session")
+        else:
+            # No project session found — fall back to claude's --continue.
+            claude_passthrough.append("--continue")
+
+    # ── Prepend session summary comment when continuing/resuming ──────────
+    if session_file is not None:
+        initial_content = _session_summary_comment(session_file) + initial_content
 
     # ── Edit prompt ───────────────────────────────────────────────────────────
-    prompt = edit_prompt(initial_content, hist_file)
+    raw_prompt = edit_prompt(initial_content)
+    prompt = _strip_leading_comments(raw_prompt)
     if not prompt.strip():
         return 0
 
@@ -487,12 +739,21 @@ def main(argv: list[str] | None = None) -> int:
 
         session_id = extract_session_id(tmpjson)
         if session_id:
-            # Append to an existing file for this session if present (e.g. cross-day
-            # continuation), otherwise start a new file in today's date dir.
-            target = find_session_file(sessions_base, session_id) or (
-                today_dir / f"{session_id}.md"
+            # Append to an existing file for this session if present (e.g.
+            # cross-day continuation), otherwise generate a slug and start a
+            # new file in today's date dir.
+            target = find_session_file(sessions_base, session_id)
+            if target is None:
+                slug = generate_slug(prompt, Path.cwd())
+                target = today_dir / f"{slug}.md"
+                i = 2
+                while target.exists():
+                    target = today_dir / f"{slug}-{i}.md"
+                    i += 1
+            append_to_history(
+                target, prompt, tmpmd,
+                project_dir=Path.cwd(), session_id=session_id,
             )
-            append_to_history(target, prompt, tmpmd, project_dir=Path.cwd())
     finally:
         tmpjson.unlink(missing_ok=True)
         tmpmd.unlink(missing_ok=True)

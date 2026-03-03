@@ -16,11 +16,16 @@ import pytest
 
 from cl_tool import (
     _GIT_EXCLUDE_ENTRY,
+    _parse_front_matter,
     _read_global_excludes_file,
+    _sanitize_slug,
     append_to_history,
     build_stdin_block,
     extract_session_id,
+    find_project_sessions,
+    find_session_file,
     find_sessions,
+    generate_slug,
     parse_args,
     select_session_menu,
     setup_git_excludes,
@@ -248,9 +253,9 @@ class TestParseArgs:
         ns, _ = parse_args(["--resume"])
         assert ns.resume_session is True
 
-    def test_continue_is_forwarded_to_claude(self):
+    def test_continue_not_forwarded_by_parse_args(self):
         _, claude_args = parse_args(["-c"])
-        assert "--continue" in claude_args
+        assert "--continue" not in claude_args
 
     def test_resume_not_forwarded_to_claude(self):
         _, claude_args = parse_args(["-r"])
@@ -268,10 +273,11 @@ class TestParseArgs:
         assert ns.resume_session is False
         assert claude_args == []
 
-    def test_continue_not_in_claude_args_twice(self):
-        # --continue should appear exactly once even if -c is passed.
-        _, claude_args = parse_args(["-c"])
-        assert claude_args.count("--continue") == 1
+    def test_continue_sets_flag_only(self):
+        # -c sets the namespace flag but does not add --continue to passthrough.
+        ns, claude_args = parse_args(["-c"])
+        assert ns.continue_session is True
+        assert "--continue" not in claude_args
 
     def test_mixed_cl_and_claude_args(self):
         ns, claude_args = parse_args(["-c", "--model", "claude-3", "--verbose"])
@@ -279,7 +285,7 @@ class TestParseArgs:
         assert "--model" in claude_args
         assert "claude-3" in claude_args
         assert "--verbose" in claude_args
-        assert "--continue" in claude_args
+        assert "--continue" not in claude_args
 
     def test_resume_does_not_set_continue(self):
         ns, _ = parse_args(["-r"])
@@ -451,3 +457,186 @@ class TestAppendToHistory:
         append_to_history(hist, "prompt text", md)
         content = hist.read_text()
         assert content.startswith("> prompt text\n\n")
+
+    def test_session_id_in_front_matter(self, tmp_path):
+        hist = tmp_path / "my-slug.md"
+        md = tmp_path / "resp.md"
+        md.write_text("answer")
+        append_to_history(
+            hist, "question", md,
+            project_dir=Path("/project"), session_id="sess-abc123",
+        )
+        content = hist.read_text()
+        assert "session: sess-abc123" in content
+
+    def test_session_id_defaults_to_stem(self, tmp_path):
+        hist = tmp_path / "sess-xyz.md"
+        md = tmp_path / "resp.md"
+        md.write_text("answer")
+        append_to_history(hist, "q", md, project_dir=Path("/project"))
+        content = hist.read_text()
+        assert "session: sess-xyz" in content
+
+
+# ── _parse_front_matter ────────────────────────────────────────────────────────
+
+
+class TestParseFrontMatter:
+    def test_parses_standard_front_matter(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text(
+            "---\n"
+            "session: abc123\n"
+            "project: /tmp/work\n"
+            "date: 2026-03-03\n"
+            "---\n\ncontent"
+        )
+        result = _parse_front_matter(f)
+        assert result == {
+            "session": "abc123",
+            "project": "/tmp/work",
+            "date": "2026-03-03",
+        }
+
+    def test_returns_empty_dict_for_no_front_matter(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("Just content")
+        assert _parse_front_matter(f) == {}
+
+    def test_returns_empty_dict_for_missing_file(self, tmp_path):
+        assert _parse_front_matter(tmp_path / "nonexistent.md") == {}
+
+    def test_returns_empty_dict_for_unclosed_front_matter(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("---\nsession: abc\n")
+        assert _parse_front_matter(f) == {}
+
+    def test_empty_file(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("")
+        assert _parse_front_matter(f) == {}
+
+
+# ── _sanitize_slug ────────────────────────────────────────────────────────────
+
+
+class TestSanitizeSlug:
+    def test_basic_slug(self):
+        assert _sanitize_slug("fix auth bug") == "fix-auth-bug"
+
+    def test_strips_special_chars(self):
+        assert _sanitize_slug("fix-auth-bug!@#$%") == "fix-auth-bug"
+
+    def test_lowercases(self):
+        assert _sanitize_slug("Fix Auth Bug") == "fix-auth-bug"
+
+    def test_limits_words(self):
+        result = _sanitize_slug("one two three four five six seven")
+        assert result.count("-") <= 4  # max 5 words = 4 hyphens
+
+    def test_strips_leading_trailing_hyphens(self):
+        assert _sanitize_slug("-hello-world-") == "hello-world"
+
+    def test_empty_string(self):
+        assert _sanitize_slug("") == ""
+
+    def test_collapses_hyphens(self):
+        assert _sanitize_slug("fix---auth---bug") == "fix-auth-bug"
+
+
+# ── find_session_file ─────────────────────────────────────────────────────────
+
+
+class TestFindSessionFile:
+    def test_finds_by_front_matter(self, tmp_path):
+        d = tmp_path / "2026-03-03"
+        d.mkdir()
+        f = d / "fix-bug.md"
+        f.write_text("---\nsession: sess-abc\nproject: /work\ndate: 2026-03-03\n---\n")
+        result = find_session_file(tmp_path, "sess-abc")
+        assert result == f
+
+    def test_returns_none_when_not_found(self, tmp_path):
+        d = tmp_path / "2026-03-03"
+        d.mkdir()
+        f = d / "fix-bug.md"
+        f.write_text("---\nsession: sess-abc\nproject: /work\n---\n")
+        assert find_session_file(tmp_path, "sess-xyz") is None
+
+    def test_returns_none_for_empty_dir(self, tmp_path):
+        assert find_session_file(tmp_path, "sess-abc") is None
+
+
+# ── find_project_sessions ─────────────────────────────────────────────────────
+
+
+class TestFindProjectSessions:
+    def _make_session(self, base, date_str, slug, project):
+        d = base / date_str
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{slug}.md"
+        f.write_text(
+            f"---\nsession: sess-{slug}\nproject: {project}\ndate: {date_str}\n---\n"
+        )
+        return f
+
+    def test_returns_matching_sessions(self, tmp_path):
+        self._make_session(tmp_path, "2026-03-01", "fix-bug", "/project/a")
+        self._make_session(tmp_path, "2026-03-02", "add-feature", "/project/b")
+        result = find_project_sessions(tmp_path, Path("/project/a"))
+        assert len(result) == 1
+        assert result[0].stem == "fix-bug"
+
+    def test_returns_empty_for_no_match(self, tmp_path):
+        self._make_session(tmp_path, "2026-03-01", "fix-bug", "/project/a")
+        result = find_project_sessions(tmp_path, Path("/project/c"))
+        assert result == []
+
+    def test_sorted_newest_first(self, tmp_path):
+        import time
+        self._make_session(tmp_path, "2026-03-01", "old-session", "/project/a")
+        time.sleep(0.02)
+        self._make_session(tmp_path, "2026-03-02", "new-session", "/project/a")
+        result = find_project_sessions(tmp_path, Path("/project/a"))
+        assert result[0].stem == "new-session"
+        assert result[1].stem == "old-session"
+
+    def test_empty_dir(self, tmp_path):
+        assert find_project_sessions(tmp_path, Path("/project/a")) == []
+
+
+# ── generate_slug ──────────────────────────────────────────────────────────────
+
+
+class TestGenerateSlug:
+    def test_returns_sanitized_slug(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="Fix Auth Bug\n")
+            result = generate_slug("Fix the auth bug", Path("/project"))
+            assert result == "fix-auth-bug"
+
+    def test_falls_back_on_failure(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError()
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_falls_back_on_timeout(self):
+        import subprocess
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired("claude", 30)
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_falls_back_on_empty_output(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_uses_custom_claude_bin(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="my-slug\n")
+            generate_slug("prompt", Path("/p"), claude_bin="/usr/bin/my-claude")
+            cmd = mock_run.call_args[0][0]
+            assert cmd[0] == "/usr/bin/my-claude"

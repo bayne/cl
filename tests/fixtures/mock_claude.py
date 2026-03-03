@@ -29,6 +29,11 @@ sys.stdin.read()
 sys.stderr.write(f"MOCK_CLAUDE_ARGS: {args}\n")
 sys.stderr.flush()
 
+# Non-stream call (e.g. slug generation) — return a plain-text slug.
+if "--output-format=stream-json" not in args:
+    print("mock-session-slug", flush=True)
+    sys.exit(0)
+
 MESSAGES = [
     {"type": "system", "subtype": "init", "session_id": SESSION_ID, "tools": []},
     {

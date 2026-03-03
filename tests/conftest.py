@@ -54,6 +54,8 @@ def cl_env(tmp_path):
     env["EDITOR"] = str(bin_dir / "editor")
     env["HOME"] = str(home_dir)
     env["MOCK_EDITOR_PROMPT"] = DEFAULT_MOCK_PROMPT
+    # Strip TMUX so tests always exercise the non-tmux editor path.
+    env.pop("TMUX", None)
 
     yield {
         "work_dir": work_dir,

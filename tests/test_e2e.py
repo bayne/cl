@@ -77,10 +77,10 @@ class TestBasicInvocation:
         run_cl(cl_env)
         assert len(session_files(cl_env)) == 1
 
-    def test_session_file_named_by_session_id(self, cl_env):
+    def test_session_file_named_by_slug(self, cl_env):
         run_cl(cl_env)
         files = session_files(cl_env)
-        assert files[0].stem == MOCK_SESSION_ID
+        assert files[0].stem == "mock-session-slug"
 
     def test_history_contains_prompt(self, cl_env):
         run_cl(cl_env)
@@ -135,10 +135,16 @@ class TestContinueFlag:
         result = run_cl(cl_env, "--continue")
         assert result.returncode == 0
 
-    def test_continue_forwarded_to_claude(self, cl_env):
-        run_cl(cl_env, "-c")
-        # Mock claude prints its args to stderr.
-        # Re-run and capture stderr to check forwarding.
+    def test_continue_uses_resume_for_project_session(self, cl_env):
+        # First run creates a session for this project.
+        run_cl(cl_env)
+        # Second run with -c should resume that project-specific session.
+        result = run_cl(cl_env, "-c")
+        assert "--resume" in result.stderr
+        assert MOCK_SESSION_ID in result.stderr
+
+    def test_continue_falls_back_when_no_project_session(self, cl_env):
+        # First -c with no prior sessions falls back to --continue.
         result = run_cl(cl_env, "-c")
         assert "--continue" in result.stderr
 
