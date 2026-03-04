@@ -51,7 +51,7 @@ def run_cl(
 
 
 def sessions_base(cl_env: dict) -> Path:
-    return cl_env["home_dir"] / ".local" / "cl" / "sessions"
+    return cl_env["home_dir"] / ".local" / "share" / "cl" / "sessions"
 
 
 def session_files(cl_env: dict) -> list[Path]:
@@ -77,10 +77,10 @@ class TestBasicInvocation:
         run_cl(cl_env)
         assert len(session_files(cl_env)) == 1
 
-    def test_session_file_named_by_slug(self, cl_env):
+    def test_session_file_named_by_slug_and_session_id(self, cl_env):
         run_cl(cl_env)
         files = session_files(cl_env)
-        assert files[0].stem == "mock-session-slug"
+        assert files[0].stem == f"mock-session-slug-{MOCK_SESSION_ID}"
 
     def test_history_contains_prompt(self, cl_env):
         run_cl(cl_env)
@@ -288,3 +288,156 @@ class TestHistoryFileStructure:
         run_cl(cl_env)
         content = session_files(cl_env)[0].read_text()
         assert f"session: {MOCK_SESSION_ID}" in content
+
+
+# ── Session file naming format ───────────────────────────────────────────────
+
+
+class TestSessionFileNaming:
+    """Verify session file naming: ~/.local/share/cl/sessions/<date>/<slug>-<session-id>.md"""
+
+    def test_sessions_under_xdg_share_path(self, cl_env):
+        run_cl(cl_env)
+        base = sessions_base(cl_env)
+        assert base == cl_env["home_dir"] / ".local" / "share" / "cl" / "sessions"
+        files = session_files(cl_env)
+        assert len(files) == 1
+        assert str(files[0]).startswith(str(base))
+
+    def test_date_directory_is_iso_format(self, cl_env):
+        import re
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        date_dir = files[0].parent.name
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", date_dir)
+
+    def test_date_directory_is_today(self, cl_env):
+        from datetime import date
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        assert files[0].parent.name == date.today().isoformat()
+
+    def test_filename_contains_slug_and_session_id(self, cl_env):
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        stem = files[0].stem
+        # Format: <semantic-slug>-<session-id>
+        assert stem == f"mock-session-slug-{MOCK_SESSION_ID}"
+
+    def test_filename_ends_with_session_id(self, cl_env):
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        assert files[0].stem.endswith(MOCK_SESSION_ID)
+
+    def test_filename_starts_with_slug(self, cl_env):
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        assert files[0].stem.startswith("mock-session-slug-")
+
+    def test_full_path_format(self, cl_env):
+        """Verify the complete path matches the expected format."""
+        from datetime import date
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        expected_base = cl_env["home_dir"] / ".local" / "share" / "cl" / "sessions"
+        expected = expected_base / date.today().isoformat() / f"mock-session-slug-{MOCK_SESSION_ID}.md"
+        assert files[0] == expected
+
+    def test_suffix_is_md(self, cl_env):
+        run_cl(cl_env)
+        files = session_files(cl_env)
+        assert files[0].suffix == ".md"
+
+
+# ── Happy path functional tests ─────────────────────────────────────────────
+
+
+class TestHappyPath:
+    """Functional tests for the main happy-path workflow."""
+
+    def test_new_session_end_to_end(self, cl_env):
+        """New session: prompt → pipeline → session file created with correct content."""
+        result = run_cl(cl_env)
+        assert result.returncode == 0
+
+        files = session_files(cl_env)
+        assert len(files) == 1
+
+        content = files[0].read_text()
+        # Front matter present
+        assert content.startswith("---\n")
+        assert f"session: {MOCK_SESSION_ID}" in content
+        assert f"project: {cl_env['work_dir']}" in content
+        # Prompt and response
+        assert f"> {DEFAULT_MOCK_PROMPT}" in content
+        assert "Hello from mock Claude!" in content
+
+    def test_continue_session_end_to_end(self, cl_env):
+        """Continue: first run creates session, second run with -c appends to it."""
+        run_cl(cl_env)
+        files_before = session_files(cl_env)
+        assert len(files_before) == 1
+
+        cl_env["env"]["MOCK_EDITOR_PROMPT"] = "Follow-up question"
+        result = run_cl(cl_env, "-c")
+        assert result.returncode == 0
+
+        files_after = session_files(cl_env)
+        assert len(files_after) == 1  # Same file, not a new one
+        content = files_after[0].read_text()
+        assert DEFAULT_MOCK_PROMPT in content
+        assert "Follow-up question" in content
+
+    def test_prompt_echoed_before_response(self, cl_env):
+        """User's prompt is echoed to stdout."""
+        result = run_cl(cl_env)
+        assert DEFAULT_MOCK_PROMPT in result.stdout
+
+    def test_pipeline_passes_fixed_flags(self, cl_env):
+        """Fixed claude flags (--print, --verbose, --output-format) are always passed."""
+        result = run_cl(cl_env)
+        assert "--print" in result.stderr
+        assert "--verbose" in result.stderr
+        assert "--output-format=stream-json" in result.stderr
+
+    def test_empty_prompt_aborts_gracefully(self, cl_env):
+        """Empty prompt exits 0 without creating a session file."""
+        cl_env["env"]["MOCK_EDITOR_PROMPT"] = ""
+        result = run_cl(cl_env)
+        assert result.returncode == 0
+        assert session_files(cl_env) == []
+
+    def test_continue_no_prior_session_falls_back(self, cl_env):
+        """With -c but no prior project session, falls back to --continue."""
+        result = run_cl(cl_env, "-c")
+        assert result.returncode == 0
+        assert "--continue" in result.stderr
+
+    def test_session_file_has_correct_front_matter_fields(self, cl_env):
+        """Front matter contains exactly session, project, and date fields."""
+        from datetime import date
+        run_cl(cl_env)
+        content = session_files(cl_env)[0].read_text()
+        # Extract front matter
+        fm_end = content.index("\n---\n", 4)
+        fm_block = content[4:fm_end]
+        keys = [line.split(":")[0].strip() for line in fm_block.splitlines() if ":" in line]
+        assert "session" in keys
+        assert "project" in keys
+        assert "date" in keys
+
+    def test_multi_turn_conversation(self, cl_env):
+        """Multiple turns accumulate in the same session file."""
+        run_cl(cl_env)
+
+        for i in range(3):
+            cl_env["env"]["MOCK_EDITOR_PROMPT"] = f"Turn {i+2}"
+            run_cl(cl_env, "-c")
+
+        files = session_files(cl_env)
+        assert len(files) == 1
+        content = files[0].read_text()
+        assert DEFAULT_MOCK_PROMPT in content
+        assert "Turn 2" in content
+        assert "Turn 3" in content
+        assert "Turn 4" in content

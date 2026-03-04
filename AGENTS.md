@@ -6,7 +6,7 @@
 - Vim-based prompt editing (split view when continuing a session)
 - Piped-stdin wrapping (pre-populates the editor with a fenced code block)
 - Stream-json output piped through `print-my-ride` for rich rendering
-- Session history saved to `~/.local/cl/sessions/<date>/<slug>.md` with YAML front matter
+- Session history saved to `~/.local/share/cl/sessions/<date>/<slug>.md` with YAML front matter
 - Semantic slug generation: calls `claude --print` to produce a 2-4 word kebab-case filename for each new session
 - Project-specific continue (`-c`): scans session front matter to resume the most recent session for the current project
 - Session resume (`-r`): interactive picker across all sessions
@@ -109,7 +109,7 @@ shared `cl_env` fixture.
 
 ## Session file format
 
-Session files live under `~/.local/cl/sessions/<YYYY-MM-DD>/<slug>.md`.
+Session files live under `~/.local/share/cl/sessions/<YYYY-MM-DD>/<slug>-<session-id>.md`.
 Each file starts with YAML front matter:
 
 ```yaml

@@ -29,7 +29,7 @@ from pathlib import Path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_SESSIONS_DIR = Path.home() / ".local" / "cl" / "sessions"
+_SESSIONS_DIR = Path.home() / ".local" / "share" / "cl" / "sessions"
 
 _CLAUDE_FIXED_ARGS = ["--print", "--verbose", "--output-format=stream-json"]
 _PMR_FIXED_ARGS = ["-l", "full", "-m", "full"]
@@ -677,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ns, claude_passthrough = parse_args(argv)
 
-    sessions_base = Path.home() / ".local" / "cl" / "sessions"
+    sessions_base = Path.home() / ".local" / "share" / "cl" / "sessions"
     today_dir = sessions_base / date.today().isoformat()
     today_dir.mkdir(parents=True, exist_ok=True)
 
@@ -745,10 +745,10 @@ def main(argv: list[str] | None = None) -> int:
             target = find_session_file(sessions_base, session_id)
             if target is None:
                 slug = generate_slug(prompt, Path.cwd())
-                target = today_dir / f"{slug}.md"
+                target = today_dir / f"{slug}-{session_id}.md"
                 i = 2
                 while target.exists():
-                    target = today_dir / f"{slug}-{i}.md"
+                    target = today_dir / f"{slug}-{i}-{session_id}.md"
                     i += 1
             append_to_history(
                 target, prompt, tmpmd,

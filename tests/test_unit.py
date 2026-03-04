@@ -16,9 +16,14 @@ import pytest
 
 from cl_tool import (
     _GIT_EXCLUDE_ENTRY,
+    _SESSIONS_DIR,
+    _comment_end_line,
+    _in_tmux,
     _parse_front_matter,
     _read_global_excludes_file,
     _sanitize_slug,
+    _session_summary_comment,
+    _strip_leading_comments,
     append_to_history,
     build_stdin_block,
     extract_session_id,
@@ -27,6 +32,8 @@ from cl_tool import (
     find_sessions,
     generate_slug,
     parse_args,
+    select_session,
+    select_session_fzf,
     select_session_menu,
     setup_git_excludes,
 )
@@ -640,3 +647,446 @@ class TestGenerateSlug:
             generate_slug("prompt", Path("/p"), claude_bin="/usr/bin/my-claude")
             cmd = mock_run.call_args[0][0]
             assert cmd[0] == "/usr/bin/my-claude"
+
+    def test_falls_back_on_nonzero_exit(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="some-slug\n")
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_falls_back_on_oserror(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.side_effect = OSError("permission denied")
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_falls_back_when_sanitized_slug_is_empty(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            # All special chars → sanitize returns empty string
+            mock_run.return_value = MagicMock(returncode=0, stdout="!@#$%\n")
+            result = generate_slug("Fix bug", Path("/project"))
+            assert result.startswith("session-")
+
+    def test_prompt_truncated_to_300_chars(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="long-prompt\n")
+            long_prompt = "x" * 500
+            generate_slug(long_prompt, Path("/project"))
+            sent_input = mock_run.call_args[1]["input"]
+            # prompt[:300] is used in the slug prompt
+            assert "x" * 300 in sent_input
+            assert "x" * 301 not in sent_input
+
+    def test_passes_print_flag(self):
+        with patch("cl_tool.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="my-slug\n")
+            generate_slug("prompt", Path("/project"))
+            cmd = mock_run.call_args[0][0]
+            assert "--print" in cmd
+
+
+# ── _session_summary_comment ─────────────────────────────────────────────────
+
+
+class TestSessionSummaryComment:
+    def _make_session(self, tmp_path, prompts, date_str="2026-03-04"):
+        f = tmp_path / "fix-auth-bug.md"
+        lines = [
+            "---\n",
+            "session: sess-abc\n",
+            f"project: /work\n",
+            f"date: {date_str}\n",
+            "---\n\n",
+        ]
+        for p in prompts:
+            lines.append(f"> {p}\n\n")
+            lines.append("Response content\n\n")
+        f.write_text("".join(lines))
+        return f
+
+    def test_starts_with_comment_hash(self, tmp_path):
+        f = self._make_session(tmp_path, ["Hello"])
+        result = _session_summary_comment(f)
+        assert result.startswith("#")
+
+    def test_includes_slug_name(self, tmp_path):
+        f = self._make_session(tmp_path, ["Hello"])
+        result = _session_summary_comment(f)
+        assert "fix-auth-bug" in result
+
+    def test_includes_date(self, tmp_path):
+        f = self._make_session(tmp_path, ["Hello"], date_str="2026-01-15")
+        result = _session_summary_comment(f)
+        assert "2026-01-15" in result
+
+    def test_includes_prompts(self, tmp_path):
+        f = self._make_session(tmp_path, ["First question", "Second question"])
+        result = _session_summary_comment(f)
+        assert "First question" in result
+        assert "Second question" in result
+
+    def test_limits_to_last_five_prompts(self, tmp_path):
+        prompts = [f"Prompt {i}" for i in range(8)]
+        f = self._make_session(tmp_path, prompts)
+        result = _session_summary_comment(f)
+        # Should include prompts 3-7 (last 5)
+        assert "Prompt 3" in result
+        assert "Prompt 7" in result
+        assert "Prompt 0" not in result
+
+    def test_truncates_long_prompts(self, tmp_path):
+        long = "x" * 100
+        f = self._make_session(tmp_path, [long])
+        result = _session_summary_comment(f)
+        assert "..." in result
+
+    def test_ends_with_newline(self, tmp_path):
+        f = self._make_session(tmp_path, ["Hello"])
+        result = _session_summary_comment(f)
+        assert result.endswith("\n")
+
+    def test_no_date_in_front_matter(self, tmp_path):
+        f = tmp_path / "my-session.md"
+        f.write_text("---\nsession: abc\nproject: /work\n---\n\n> Hello\n")
+        result = _session_summary_comment(f)
+        assert "my-session" in result
+        # No parenthesized date
+        assert "()" not in result
+
+    def test_handles_oserror_on_read(self, tmp_path):
+        f = tmp_path / "bad.md"
+        f.write_text("---\nsession: abc\ndate: 2026-01-01\n---\n")
+        # Permissions issue won't happen in tmp_path easily, but function
+        # handles OSError gracefully — prompts list stays empty.
+        result = _session_summary_comment(f)
+        assert "bad" in result
+
+
+# ── _strip_leading_comments ──────────────────────────────────────────────────
+
+
+class TestStripLeadingComments:
+    def test_strips_comment_lines(self):
+        text = "# comment 1\n# comment 2\n\nactual content\n"
+        assert _strip_leading_comments(text) == "actual content\n"
+
+    def test_strips_blank_lines_after_comments(self):
+        text = "# comment\n\n\nfirst line\n"
+        assert _strip_leading_comments(text) == "first line\n"
+
+    def test_no_comments(self):
+        text = "hello world\n"
+        assert _strip_leading_comments(text) == "hello world\n"
+
+    def test_empty_string(self):
+        assert _strip_leading_comments("") == ""
+
+    def test_only_comments(self):
+        text = "# comment 1\n# comment 2\n"
+        assert _strip_leading_comments(text) == ""
+
+    def test_only_comments_and_blanks(self):
+        text = "# comment\n\n\n"
+        assert _strip_leading_comments(text) == ""
+
+    def test_preserves_non_leading_comments(self):
+        text = "# leading\n\ncontent\n# not leading\n"
+        result = _strip_leading_comments(text)
+        assert "content" in result
+        assert "# not leading" in result
+
+    def test_indented_comment(self):
+        text = "  # indented comment\nactual content\n"
+        result = _strip_leading_comments(text)
+        assert result == "actual content\n"
+
+
+# ── _comment_end_line ────────────────────────────────────────────────────────
+
+
+class TestCommentEndLine:
+    def test_returns_line_after_comments(self):
+        text = "# comment 1\n# comment 2\n\nfirst real line\n"
+        assert _comment_end_line(text) == 4
+
+    def test_returns_zero_for_no_comments(self):
+        assert _comment_end_line("hello world\n") == 0
+
+    def test_returns_zero_for_empty_string(self):
+        assert _comment_end_line("") == 0
+
+    def test_single_comment_then_content(self):
+        text = "# comment\ncontent\n"
+        assert _comment_end_line(text) == 2
+
+    def test_comments_with_blank_lines(self):
+        text = "# comment\n\n\nfirst\n"
+        assert _comment_end_line(text) == 4
+
+    def test_only_comments(self):
+        text = "# comment 1\n# comment 2\n"
+        # Returns past end
+        result = _comment_end_line(text)
+        assert result >= 3
+
+
+# ── _in_tmux ─────────────────────────────────────────────────────────────────
+
+
+class TestInTmux:
+    def test_returns_true_when_tmux_set(self, monkeypatch):
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+        assert _in_tmux() is True
+
+    def test_returns_false_when_tmux_unset(self, monkeypatch):
+        monkeypatch.delenv("TMUX", raising=False)
+        assert _in_tmux() is False
+
+    def test_returns_false_for_empty_tmux(self, monkeypatch):
+        monkeypatch.setenv("TMUX", "")
+        assert _in_tmux() is False
+
+
+# ── select_session_fzf ───────────────────────────────────────────────────────
+
+
+class TestSelectSessionFzf:
+    def test_returns_none_for_empty_sessions(self, tmp_path):
+        assert select_session_fzf([]) is None
+
+    def test_returns_none_when_fzf_unavailable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cl_tool.shutil.which", lambda x: None)
+        sessions = [tmp_path / "a.md"]
+        assert select_session_fzf(sessions) is None
+
+
+# ── select_session ───────────────────────────────────────────────────────────
+
+
+class TestSelectSession:
+    def test_returns_none_for_empty_sessions(self):
+        assert select_session([]) is None
+
+    def test_delegates_to_menu_when_fzf_unavailable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cl_tool.shutil.which", lambda x: None)
+        f = tmp_path / "sess.md"
+        f.write_text("")
+        # Mock the menu to return the session
+        with patch("cl_tool.select_session_menu", return_value=f) as mock_menu:
+            result = select_session([f])
+            assert result == f
+            mock_menu.assert_called_once()
+
+
+# ── _sanitize_slug (extended) ────────────────────────────────────────────────
+
+
+class TestSanitizeSlugExtended:
+    def test_max_length_60(self):
+        long = "a" * 100
+        result = _sanitize_slug(long)
+        assert len(result) <= 60
+
+    def test_underscores_stripped(self):
+        # Underscores are removed by the special-char regex (not in [a-z0-9\s-])
+        assert _sanitize_slug("fix_auth_bug") == "fixauthbug"
+
+    def test_mixed_spaces_underscores(self):
+        # Underscores are stripped; spaces become hyphens
+        assert _sanitize_slug("fix auth_bug") == "fix-authbug"
+
+    def test_unicode_stripped(self):
+        result = _sanitize_slug("café résumé")
+        assert "é" not in result
+        # "caf" and "rsum" remain (letters a-z kept)
+        assert "caf" in result
+
+    def test_numbers_preserved(self):
+        assert _sanitize_slug("fix bug 42") == "fix-bug-42"
+
+    def test_only_special_chars(self):
+        assert _sanitize_slug("!@#$%^&*()") == ""
+
+    def test_whitespace_only(self):
+        assert _sanitize_slug("   ") == ""
+
+    def test_tabs_become_hyphens(self):
+        assert _sanitize_slug("fix\tauth\tbug") == "fix-auth-bug"
+
+    def test_newlines_become_hyphens(self):
+        result = _sanitize_slug("fix\nauth\nbug")
+        assert result == "fix-auth-bug"
+
+    def test_five_words_kept(self):
+        result = _sanitize_slug("one two three four five")
+        assert result == "one-two-three-four-five"
+
+    def test_six_words_truncated_to_five(self):
+        result = _sanitize_slug("one two three four five six")
+        assert result == "one-two-three-four-five"
+
+    def test_already_kebab_case(self):
+        assert _sanitize_slug("fix-auth-bug") == "fix-auth-bug"
+
+    def test_quoted_slug(self):
+        assert _sanitize_slug('"fix-auth-bug"') == "fix-auth-bug"
+
+
+# ── _parse_front_matter (extended) ───────────────────────────────────────────
+
+
+class TestParseFrontMatterExtended:
+    def test_ignores_content_after_closing(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("---\nkey: value\n---\n\n> prompt\nmore content\n")
+        result = _parse_front_matter(f)
+        assert result == {"key": "value"}
+        assert "prompt" not in result.values()
+
+    def test_handles_colons_in_value(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("---\nproject: /home/user/project:sub\n---\n")
+        result = _parse_front_matter(f)
+        assert result["project"] == "/home/user/project:sub"
+
+    def test_strips_whitespace_from_keys_and_values(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("---\n  key  :  value  \n---\n")
+        result = _parse_front_matter(f)
+        assert result["key"] == "value"
+
+    def test_empty_value_skipped(self, tmp_path):
+        f = tmp_path / "sess.md"
+        f.write_text("---\nkey:\n---\n")
+        result = _parse_front_matter(f)
+        assert "key" not in result
+
+
+# ── extract_session_id (extended) ────────────────────────────────────────────
+
+
+class TestExtractSessionIdExtended:
+    def test_ignores_empty_session_id(self, tmp_path):
+        jf = tmp_path / "out.json"
+        jf.write_text(
+            json.dumps({"session_id": ""}) + "\n"
+            + json.dumps({"session_id": "sess-real"}) + "\n"
+        )
+        assert extract_session_id(jf) == "sess-real"
+
+    def test_returns_first_of_multiple(self, tmp_path):
+        jf = tmp_path / "out.json"
+        jf.write_text(
+            json.dumps({"session_id": "first"}) + "\n"
+            + json.dumps({"session_id": "second"}) + "\n"
+        )
+        assert extract_session_id(jf) == "first"
+
+    def test_handles_nested_json(self, tmp_path):
+        jf = tmp_path / "out.json"
+        jf.write_text(json.dumps({"data": {"nested": True}, "session_id": "sess-nested"}) + "\n")
+        assert extract_session_id(jf) == "sess-nested"
+
+
+# ── append_to_history (extended) ─────────────────────────────────────────────
+
+
+class TestAppendToHistoryExtended:
+    def test_front_matter_structure(self, tmp_path):
+        hist = tmp_path / "my-slug.md"
+        md = tmp_path / "resp.md"
+        md.write_text("answer")
+        append_to_history(
+            hist, "question", md,
+            project_dir=Path("/work/project"), session_id="sess-xyz",
+        )
+        content = hist.read_text()
+        assert content.startswith("---\n")
+        assert "session: sess-xyz" in content
+        assert "project: /work/project" in content
+        lines = content.split("\n---\n")
+        assert len(lines) >= 2
+
+    def test_front_matter_includes_todays_date(self, tmp_path):
+        from datetime import date
+        hist = tmp_path / "slug.md"
+        md = tmp_path / "resp.md"
+        md.write_text("answer")
+        append_to_history(hist, "q", md, project_dir=Path("/p"), session_id="s1")
+        content = hist.read_text()
+        assert f"date: {date.today().isoformat()}" in content
+
+    def test_no_front_matter_without_project_dir(self, tmp_path):
+        hist = tmp_path / "sess.md"
+        md = tmp_path / "resp.md"
+        md.write_text("answer")
+        append_to_history(hist, "q", md)
+        content = hist.read_text()
+        assert not content.startswith("---\n")
+
+    def test_second_append_no_duplicate_front_matter(self, tmp_path):
+        hist = tmp_path / "sess.md"
+        md = tmp_path / "r1.md"
+        md.write_text("a1")
+        append_to_history(hist, "q1", md, project_dir=Path("/p"), session_id="s1")
+        md2 = tmp_path / "r2.md"
+        md2.write_text("a2")
+        append_to_history(hist, "q2", md2, project_dir=Path("/p"), session_id="s1")
+        content = hist.read_text()
+        assert content.count("---\n") == 2  # opening and closing of single front matter
+
+
+# ── find_session_file (extended) ─────────────────────────────────────────────
+
+
+class TestFindSessionFileExtended:
+    def test_searches_across_date_dirs(self, tmp_path):
+        d1 = tmp_path / "2026-01-01"
+        d1.mkdir()
+        d2 = tmp_path / "2026-02-15"
+        d2.mkdir()
+        f = d2 / "fix-bug.md"
+        f.write_text("---\nsession: target-id\nproject: /work\n---\n")
+        (d1 / "other.md").write_text("---\nsession: other-id\nproject: /work\n---\n")
+        result = find_session_file(tmp_path, "target-id")
+        assert result == f
+
+    def test_ignores_files_without_front_matter(self, tmp_path):
+        d = tmp_path / "2026-01-01"
+        d.mkdir()
+        (d / "no-fm.md").write_text("Just plain content")
+        assert find_session_file(tmp_path, "any-id") is None
+
+
+# ── find_project_sessions (extended) ─────────────────────────────────────────
+
+
+class TestFindProjectSessionsExtended:
+    def test_returns_multiple_matching_sessions(self, tmp_path):
+        for i, slug in enumerate(["sess-a", "sess-b", "sess-c"]):
+            d = tmp_path / f"2026-03-0{i+1}"
+            d.mkdir()
+            f = d / f"{slug}.md"
+            f.write_text(f"---\nsession: {slug}\nproject: /project/x\ndate: 2026-03-0{i+1}\n---\n")
+            time.sleep(0.02)
+        result = find_project_sessions(tmp_path, Path("/project/x"))
+        assert len(result) == 3
+        # Newest first
+        assert result[0].stem == "sess-c"
+
+    def test_does_not_match_substring_of_project(self, tmp_path):
+        d = tmp_path / "2026-03-01"
+        d.mkdir()
+        f = d / "sess.md"
+        f.write_text("---\nsession: s1\nproject: /project/abc\n---\n")
+        result = find_project_sessions(tmp_path, Path("/project/ab"))
+        assert result == []
+
+
+# ── _SESSIONS_DIR constant ───────────────────────────────────────────────────
+
+
+class TestSessionsDir:
+    def test_uses_xdg_share_path(self):
+        path_str = str(_SESSIONS_DIR)
+        assert ".local/share/cl/sessions" in path_str
