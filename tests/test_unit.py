@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -26,7 +27,9 @@ from cl_tool import (
     find_session_file,
     find_sessions,
     generate_slug,
+    main,
     parse_args,
+    run_pipeline,
     select_session_menu,
     setup_git_excludes,
 )
@@ -640,3 +643,91 @@ class TestGenerateSlug:
             generate_slug("prompt", Path("/p"), claude_bin="/usr/bin/my-claude")
             cmd = mock_run.call_args[0][0]
             assert cmd[0] == "/usr/bin/my-claude"
+
+
+# ── run_pipeline KeyboardInterrupt ────────────────────────────────────────────
+
+
+class TestRunPipelineKeyboardInterrupt:
+    """Verify that Ctrl+C during run_pipeline terminates both subprocesses."""
+
+    def test_keyboard_interrupt_terminates_processes(self, tmp_path):
+        json_path = tmp_path / "out.json"
+        md_path = tmp_path / "out.md"
+
+        original_join = threading.Thread.join
+
+        def interrupt_on_join(self_thread, *args, **kwargs):
+            raise KeyboardInterrupt
+
+        with (
+            patch("cl_tool.subprocess.Popen") as mock_popen_cls,
+            patch.object(threading.Thread, "join", interrupt_on_join),
+        ):
+            mock_claude = MagicMock()
+            mock_claude.stdin = MagicMock()
+            mock_claude.stdout = iter([])
+            mock_claude.__enter__ = MagicMock(return_value=mock_claude)
+            mock_claude.__exit__ = MagicMock(return_value=False)
+
+            mock_pmr = MagicMock()
+            mock_pmr.stdin = MagicMock()
+            mock_pmr.__enter__ = MagicMock(return_value=mock_pmr)
+            mock_pmr.__exit__ = MagicMock(return_value=False)
+
+            mock_popen_cls.side_effect = [mock_claude, mock_pmr]
+
+            with pytest.raises(KeyboardInterrupt):
+                run_pipeline("test", [], json_path, md_path)
+
+            mock_claude.terminate.assert_called_once()
+            mock_pmr.terminate.assert_called_once()
+            mock_claude.wait.assert_called_once()
+            mock_pmr.wait.assert_called_once()
+
+    def test_tee_handles_broken_pipe(self, tmp_path):
+        """_tee() catches BrokenPipeError when pmr exits early."""
+        json_path = tmp_path / "out.json"
+        md_path = tmp_path / "out.md"
+
+        with (
+            patch("cl_tool.subprocess.Popen") as mock_popen_cls,
+        ):
+            mock_claude = MagicMock()
+            mock_claude.stdin = MagicMock()
+            # Simulate claude producing output lines.
+            mock_claude.stdout = iter(['{"type":"system"}\n', '{"type":"result"}\n'])
+            mock_claude.__enter__ = MagicMock(return_value=mock_claude)
+            mock_claude.__exit__ = MagicMock(return_value=False)
+
+            mock_pmr = MagicMock()
+            mock_pmr.stdin = MagicMock()
+            # pmr stdin write raises BrokenPipeError on first write.
+            mock_pmr.stdin.write.side_effect = BrokenPipeError("broken pipe")
+            mock_pmr.returncode = 0
+            mock_pmr.__enter__ = MagicMock(return_value=mock_pmr)
+            mock_pmr.__exit__ = MagicMock(return_value=False)
+
+            mock_popen_cls.side_effect = [mock_claude, mock_pmr]
+
+            # Should not raise — _tee catches BrokenPipeError.
+            result = run_pipeline("test", [], json_path, md_path)
+            assert result == 0
+
+
+# ── main() KeyboardInterrupt ──────────────────────────────────────────────────
+
+
+class TestMainKeyboardInterrupt:
+    def test_main_returns_130_on_ctrl_c(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setattr("cl_tool.Path.cwd", staticmethod(lambda: tmp_path))
+
+        with (
+            patch("cl_tool.run_pipeline", side_effect=KeyboardInterrupt),
+            patch("cl_tool.read_piped_stdin", return_value=None),
+            patch("cl_tool.edit_prompt", return_value="test prompt"),
+            patch("cl_tool.setup_git_excludes"),
+        ):
+            rc = main([])
+            assert rc == 130

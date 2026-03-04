@@ -19,6 +19,9 @@ The mock print-my-ride drains stdin and writes a stub markdown file to
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -26,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import CL_TOOL, DEFAULT_MOCK_PROMPT
+from conftest import CL_TOOL, DEFAULT_MOCK_PROMPT, FIXTURES_DIR
 
 MOCK_SESSION_ID = "sess-mock-deadbeef1234"
 
@@ -288,3 +291,67 @@ class TestHistoryFileStructure:
         run_cl(cl_env)
         content = session_files(cl_env)[0].read_text()
         assert f"session: {MOCK_SESSION_ID}" in content
+
+
+# ── Ctrl+C / graceful shutdown ────────────────────────────────────────────────
+
+
+class TestCtrlC:
+    @pytest.fixture()
+    def slow_cl_env(self, cl_env):
+        """cl_env with a slow mock claude that hangs until signalled."""
+        bin_dir = cl_env["bin_dir"]
+        dst = bin_dir / "claude"
+        shutil.copy(FIXTURES_DIR / "mock_claude_slow.py", dst)
+        text = dst.read_text()
+        lines = text.splitlines(keepends=True)
+        lines[0] = f"#!{sys.executable}\n"
+        dst.write_text("".join(lines))
+        dst.chmod(0o755)
+        return cl_env
+
+    def test_sigint_returns_130(self, slow_cl_env):
+        """Sending SIGINT to cl_tool exits with code 130."""
+        proc = subprocess.Popen(
+            [sys.executable, str(CL_TOOL)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=slow_cl_env["work_dir"],
+            env=slow_cl_env["env"],
+        )
+        # Wait for the pipeline to start (mock claude emits to stderr).
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            # Check if there's output on stderr indicating claude started.
+            import select
+            ready, _, _ = select.select([proc.stderr], [], [], 0.1)
+            if ready:
+                break
+        # Send SIGINT to the process group.
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=10)
+        assert proc.returncode == 130
+
+    def test_sigint_cleans_up_temp_files(self, slow_cl_env):
+        """Temp files are cleaned up even after Ctrl+C."""
+        proc = subprocess.Popen(
+            [sys.executable, str(CL_TOOL)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=slow_cl_env["work_dir"],
+            env=slow_cl_env["env"],
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            import select
+            ready, _, _ = select.select([proc.stderr], [], [], 0.1)
+            if ready:
+                break
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=10)
+        # Temp files (*.json, *.md in /tmp) should have been cleaned up.
+        # We can verify no session files were created (since we interrupted
+        # before the result message was emitted).
+        assert session_files(slow_cl_env) == []

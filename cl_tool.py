@@ -581,16 +581,30 @@ def run_pipeline(
         # JSON file and pmr's stdin.  Threading ensures claude's stdout buffer
         # never fills while pmr processes slowly.
         def _tee() -> None:
-            with open(json_path, "w") as jf:
-                for line in claude_proc.stdout:
-                    jf.write(line)
-                    pmr_proc.stdin.write(line)  # type: ignore[union-attr]
-                    pmr_proc.stdin.flush()  # type: ignore[union-attr]
-            pmr_proc.stdin.close()  # type: ignore[union-attr]
+            try:
+                with open(json_path, "w") as jf:
+                    for line in claude_proc.stdout:
+                        jf.write(line)
+                        pmr_proc.stdin.write(line)  # type: ignore[union-attr]
+                        pmr_proc.stdin.flush()  # type: ignore[union-attr]
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    pmr_proc.stdin.close()  # type: ignore[union-attr]
+                except (BrokenPipeError, OSError):
+                    pass
 
         tee_thread = threading.Thread(target=_tee, daemon=True)
         tee_thread.start()
-        tee_thread.join()
+        try:
+            tee_thread.join()
+        except KeyboardInterrupt:
+            claude_proc.terminate()
+            pmr_proc.terminate()
+            claude_proc.wait()
+            pmr_proc.wait()
+            raise
 
     return pmr_proc.returncode
 
@@ -754,6 +768,9 @@ def main(argv: list[str] | None = None) -> int:
                 target, prompt, tmpmd,
                 project_dir=Path.cwd(), session_id=session_id,
             )
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
     finally:
         tmpjson.unlink(missing_ok=True)
         tmpmd.unlink(missing_ok=True)
@@ -762,4 +779,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
