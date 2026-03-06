@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -79,6 +80,7 @@ def setup_git_excludes() -> None:
             ],
             capture_output=True,
             check=False,
+            timeout=10,
         )
 
     if excludes_path.exists():
@@ -230,6 +232,102 @@ def _in_tmux() -> bool:
     return bool(os.environ.get("TMUX"))
 
 
+# ── Pane title timer ─────────────────────────────────────────────────────────
+
+
+def _format_elapsed(seconds: int) -> str:
+    """Format seconds as fixed-width ``XXm YYs``, capped at 99m 59s."""
+    seconds = min(seconds, 99 * 60 + 59)
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes:02d}m {secs:02d}s"
+
+
+def _set_pane_title(title: str) -> None:
+    """Set the tmux pane title and window name (or terminal title as fallback)."""
+    if _in_tmux():
+        pane_id = os.environ.get("TMUX_PANE", "")
+        target = ["-t", pane_id] if pane_id else []
+        subprocess.run(
+            ["tmux", "select-pane", *target, "-T", title],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["tmux", "rename-window", *target, title],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        sys.stderr.write(f"\033]2;{title}\033\\")
+        sys.stderr.flush()
+
+
+def _install_focus_hook(*, pid_guard: bool = True) -> None:
+    """Install a tmux pane-focus-in hook that clears cl titles.
+
+    When *pid_guard* is True the hook only fires once the process (*os.getpid()*)
+    is dead — this is used at startup so a crash leaves no stale title.  When
+    False the hook fires unconditionally on next focus — used after ``stop()``
+    to clear the ``cl (done)`` notification.
+    """
+    if not _in_tmux():
+        return
+    cleanup = (
+        "select-pane -T '' \\; "
+        "set-window-option automatic-rename on \\; "
+        "set-hook -up pane-focus-in"
+    )
+    if pid_guard:
+        hook_cmd = f"if-shell 'kill -0 {os.getpid()} 2>/dev/null' '' '{cleanup}'"
+    else:
+        hook_cmd = cleanup
+    subprocess.run(
+        ["tmux", "set-hook", "-p", "pane-focus-in", hook_cmd],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _start_pane_timer():
+    """Start a background thread that updates the pane/window title with elapsed time.
+
+    Returns a *stop* callable.  The first call shows ``cl (done)`` and
+    installs a one-shot focus hook that clears the titles on next pane
+    focus; subsequent calls are no-ops.
+
+    A PID-guarded focus hook is installed at startup so that if the process
+    dies unexpectedly the stale ``cl (???s)`` title is cleared on next focus.
+    """
+    _install_focus_hook(pid_guard=True)
+    stop_event = threading.Event()
+    stopped = False
+
+    def _run():
+        start = time.monotonic()
+        _set_pane_title("cl (0s)")
+        while not stop_event.wait(1.0):
+            elapsed = int(time.monotonic() - start)
+            _set_pane_title(f"cl ({_format_elapsed(elapsed)})")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    def stop():
+        nonlocal stopped
+        if stopped:
+            return
+        stopped = True
+        stop_event.set()
+        thread.join(timeout=2)
+        _set_pane_title("cl (done)")
+        _install_focus_hook(pid_guard=False)
+
+    return stop
+
+
 # ── Session summary ──────────────────────────────────────────────────────────
 
 
@@ -338,6 +436,7 @@ def _edit_prompt_tmux(
                 ],
                 capture_output=True,
                 text=True,
+                timeout=10,
             )
             hist_pane = result.stdout.strip() or None
 
@@ -362,6 +461,7 @@ def _edit_prompt_tmux(
                 ["tmux", "kill-pane", "-t", hist_pane],
                 capture_output=True,
                 check=False,
+                timeout=10,
             )
 
 
@@ -500,18 +600,31 @@ def generate_slug(
         "Reply with ONLY the slug (e.g. fix-auth-bug). No quotes, no explanation."
     )
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [claude_bin, "--print"],
-            input=slug_prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            timeout=30,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            slug = _sanitize_slug(result.stdout)
+        proc.stdin.write(slug_prompt)
+        proc.stdin.close()
+        elapsed = 0
+        while proc.poll() is None and elapsed < 30:
+            time.sleep(1)
+            elapsed += 1
+            print(
+                f"  generating session name... ({elapsed}s)",
+                file=sys.stderr,
+            )
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        elif proc.returncode == 0:
+            slug = _sanitize_slug(proc.stdout.read())
             if slug:
                 return slug
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError):
         pass
     # Fallback: timestamp-based name.
     from datetime import datetime
@@ -602,8 +715,12 @@ def run_pipeline(
         except KeyboardInterrupt:
             claude_proc.terminate()
             pmr_proc.terminate()
-            claude_proc.wait()
-            pmr_proc.wait()
+            for proc in (claude_proc, pmr_proc):
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
             raise
 
     return pmr_proc.returncode
@@ -748,8 +865,10 @@ def main(argv: list[str] | None = None) -> int:
         tmpjson = Path(_tj.name)
         tmpmd = Path(_tm.name)
 
+    stop_timer = _start_pane_timer()
     try:
         run_pipeline(prompt, claude_passthrough, tmpjson, tmpmd, resume_id)
+        stop_timer()
 
         session_id = extract_session_id(tmpjson)
         if session_id:
@@ -772,6 +891,7 @@ def main(argv: list[str] | None = None) -> int:
         print(file=sys.stderr)
         return 130
     finally:
+        stop_timer()
         tmpjson.unlink(missing_ok=True)
         tmpmd.unlink(missing_ok=True)
 

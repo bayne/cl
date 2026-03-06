@@ -619,72 +619,80 @@ class TestFindProjectSessions:
 
 
 class TestGenerateSlug:
+    def _mock_proc(self, *, returncode=0, stdout=""):
+        mock = MagicMock()
+        mock.poll.return_value = returncode
+        mock.returncode = returncode
+        mock.stdout.read.return_value = stdout
+        return mock
+
     def test_returns_sanitized_slug(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="Fix Auth Bug\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="Fix Auth Bug\n")
             result = generate_slug("Fix the auth bug", Path("/project"))
             assert result == "fix-auth-bug"
 
     def test_falls_back_on_failure(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.side_effect = FileNotFoundError()
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.side_effect = FileNotFoundError()
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
 
     def test_falls_back_on_timeout(self):
-        import subprocess
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired("claude", 30)
+        with patch("cl_tool.subprocess.Popen") as mock_popen, \
+             patch("cl_tool.time.sleep"):
+            mock_proc = self._mock_proc()
+            mock_proc.poll.return_value = None
+            mock_popen.return_value = mock_proc
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
+            mock_proc.kill.assert_called_once()
 
     def test_falls_back_on_empty_output(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="")
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
 
     def test_uses_custom_claude_bin(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="my-slug\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="my-slug\n")
             generate_slug("prompt", Path("/p"), claude_bin="/usr/bin/my-claude")
-            cmd = mock_run.call_args[0][0]
+            cmd = mock_popen.call_args[0][0]
             assert cmd[0] == "/usr/bin/my-claude"
 
     def test_falls_back_on_nonzero_exit(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="some-slug\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(returncode=1, stdout="some-slug\n")
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
 
     def test_falls_back_on_oserror(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.side_effect = OSError("permission denied")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.side_effect = OSError("permission denied")
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
 
     def test_falls_back_when_sanitized_slug_is_empty(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            # All special chars → sanitize returns empty string
-            mock_run.return_value = MagicMock(returncode=0, stdout="!@#$%\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="!@#$%\n")
             result = generate_slug("Fix bug", Path("/project"))
             assert result.startswith("session-")
 
     def test_prompt_truncated_to_300_chars(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="long-prompt\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="long-prompt\n")
             long_prompt = "x" * 500
             generate_slug(long_prompt, Path("/project"))
-            sent_input = mock_run.call_args[1]["input"]
-            # prompt[:300] is used in the slug prompt
+            sent_input = mock_popen.return_value.stdin.write.call_args[0][0]
             assert "x" * 300 in sent_input
             assert "x" * 301 not in sent_input
 
     def test_passes_print_flag(self):
-        with patch("cl_tool.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="my-slug\n")
+        with patch("cl_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = self._mock_proc(stdout="my-slug\n")
             generate_slug("prompt", Path("/project"))
-            cmd = mock_run.call_args[0][0]
+            cmd = mock_popen.call_args[0][0]
             assert "--print" in cmd
 
 
